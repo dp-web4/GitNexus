@@ -203,6 +203,7 @@ CREATE NODE TABLE Section (
   filePath STRING,
   startLine INT64,
   endLine INT64,
+  level INT64,
   content STRING,
   description STRING,
   PRIMARY KEY (id)

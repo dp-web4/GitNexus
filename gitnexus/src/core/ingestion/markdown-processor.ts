@@ -10,14 +10,9 @@ import path from 'node:path';
 import { generateId } from '../../lib/utils.js';
 import { KnowledgeGraph, GraphNode, GraphRelationship } from '../graph/types.js';
 
-<<<<<<< HEAD
 const HEADING_RE = /^(#{1,6})\s+(.+)$/;
 const LINK_RE = /\[([^\]]*)\]\(([^)]+)\)/g;
 const MD_EXTENSIONS = new Set(['.md', '.mdx']);
-=======
-const HEADING_RE = /^(#{1,6})\s+(.+)$/gm;
-const LINK_RE = /\[([^\]]*)\]\(([^)]+)\)/g;
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
 
 interface MdFile {
   path: string;
@@ -33,12 +28,8 @@ export const processMarkdown = (
   let totalLinks = 0;
 
   for (const file of files) {
-<<<<<<< HEAD
     const ext = path.extname(file.path).toLowerCase();
     if (!MD_EXTENSIONS.has(ext)) continue;
-=======
-    if (!file.path.endsWith('.md')) continue;
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
 
     const fileNodeId = generateId('File', file.path);
     // Skip if file node doesn't exist (shouldn't happen, structure-processor creates it)
@@ -47,7 +38,6 @@ export const processMarkdown = (
     const lines = file.content.split('\n');
 
     // --- Extract headings and build hierarchy ---
-<<<<<<< HEAD
     // First pass: collect all heading positions so we can compute endLine spans
     const headings: { level: number; heading: string; lineNum: number }[] = [];
 
@@ -76,19 +66,6 @@ export const processMarkdown = (
           break;
         }
       }
-=======
-    const sectionStack: { level: number; id: string }[] = [];
-    let prevSectionLine = 0;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const match = line.match(/^(#{1,6})\s+(.+)$/);
-      if (!match) continue;
-
-      const level = match[1].length;
-      const heading = match[2].trim();
-      const lineNum = i + 1; // 1-indexed
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
 
       const sectionId = generateId('Section', `${file.path}:L${lineNum}:${heading}`);
 
@@ -99,12 +76,8 @@ export const processMarkdown = (
           name: heading,
           filePath: file.path,
           startLine: lineNum,
-<<<<<<< HEAD
           endLine,
           level,
-=======
-          endLine: lineNum,
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
           description: `h${level}`,
         },
       };
@@ -134,10 +107,7 @@ export const processMarkdown = (
 
     // --- Extract links to other files in the repo ---
     const fileDir = path.dirname(file.path);
-<<<<<<< HEAD
     const seenLinks = new Set<string>();
-=======
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
     let linkMatch: RegExpExecArray | null;
     LINK_RE.lastIndex = 0;
 
@@ -159,7 +129,6 @@ export const processMarkdown = (
 
       if (allPathSet.has(resolved)) {
         const targetFileId = generateId('File', resolved);
-<<<<<<< HEAD
 
         // Skip if target file node doesn't exist
         if (!graph.getNode(targetFileId)) continue;
@@ -171,13 +140,6 @@ export const processMarkdown = (
 
         const relId = generateId('IMPORTS', linkKey);
 
-=======
-        const relId = generateId('IMPORTS', `${fileNodeId}->${targetFileId}`);
-
-        // Only add if not already present (multiple links to same file)
-        if (!graph.getNode(targetFileId)) continue;
-
->>>>>>> 25e5aaa (feat: add markdown file indexing (headings + cross-links))
         graph.addRelationship({
           id: relId,
           type: 'IMPORTS',
