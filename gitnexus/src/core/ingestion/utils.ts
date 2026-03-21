@@ -1,6 +1,7 @@
 import type Parser from 'tree-sitter';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { generateId } from '../../lib/utils.js';
+import { extractSimpleTypeName } from './type-extractors/shared.js';
 
 /** Tree-sitter AST node. Re-exported for use across ingestion modules. */
 export type SyntaxNode = Parser.SyntaxNode;
@@ -35,7 +36,7 @@ export const DEFINITION_CAPTURE_KEYS = [
 ] as const;
 
 /** Extract the definition node from a tree-sitter query capture map. */
-export const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): any | null => {
+export const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): SyntaxNode | null => {
   for (const key of DEFINITION_CAPTURE_KEYS) {
     if (captureMap[key]) return captureMap[key];
   }
@@ -264,7 +265,7 @@ export const CLASS_CONTAINER_TYPES = new Set([
   'class_declaration', 'abstract_class_declaration',
   'interface_declaration', 'struct_declaration', 'record_declaration',
   'class_specifier', 'struct_specifier',
-  'impl_item', 'trait_item',
+  'impl_item', 'trait_item', 'struct_item', 'enum_item',
   'class_definition',
   'trait_declaration',
   'protocol_declaration',
@@ -286,6 +287,8 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   class_definition: 'Class',
   impl_item: 'Impl',
   trait_item: 'Trait',
+  struct_item: 'Struct',
+  enum_item: 'Enum',
   trait_declaration: 'Trait',
   record_declaration: 'Record',
   protocol_declaration: 'Interface',
@@ -314,6 +317,21 @@ export const findEnclosingClassId = (node: any, filePath: string): string | null
             if (inner && (inner.type === 'type_identifier' || inner.type === 'identifier')) {
               return generateId('Struct', `${filePath}:${inner.text}`);
             }
+          }
+        }
+      }
+    }
+    // Go: type_declaration wrapping a struct_type (type User struct { ... })
+    // field_declaration → field_declaration_list → struct_type → type_spec → type_declaration
+    if (current.type === 'type_declaration') {
+      const typeSpec = current.children?.find((c: any) => c.type === 'type_spec');
+      if (typeSpec) {
+        const typeBody = typeSpec.childForFieldName?.('type');
+        if (typeBody?.type === 'struct_type' || typeBody?.type === 'interface_type') {
+          const nameNode = typeSpec.childForFieldName?.('name');
+          if (nameNode) {
+            const label = typeBody.type === 'struct_type' ? 'Struct' : 'Interface';
+            return generateId(label, `${filePath}:${nameNode.text}`);
           }
         }
       }
@@ -351,7 +369,7 @@ export const findEnclosingClassId = (node: any, filePath: string): string | null
  * Extract function name and label from a function_definition or similar AST node.
  * Handles C/C++ qualified_identifier (ClassName::MethodName) and other language patterns.
  */
-export const extractFunctionName = (node: any): { funcName: string | null; label: string } => {
+export const extractFunctionName = (node: SyntaxNode): { funcName: string | null; label: string } => {
   let funcName: string | null = null;
   let label = 'Function';
 
@@ -366,33 +384,63 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
   if (FUNCTION_DECLARATION_TYPES.has(node.type)) {
     // C/C++: function_definition -> [pointer_declarator ->] function_declarator -> qualified_identifier/identifier
     // Unwrap pointer_declarator / reference_declarator wrappers to reach function_declarator
-    let declarator = node.childForFieldName?.('declarator') ||
-                        node.children?.find((c: any) => c.type === 'function_declarator');
+    let declarator = node.childForFieldName?.('declarator');
+    if (!declarator) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'function_declarator') { declarator = c; break; }
+      }
+    }
     while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
-      declarator = declarator.childForFieldName?.('declarator') ||
-                   declarator.children?.find((c: any) =>
-                     c.type === 'function_declarator' || c.type === 'pointer_declarator' || c.type === 'reference_declarator');
+      let nextDeclarator = declarator.childForFieldName?.('declarator');
+      if (!nextDeclarator) {
+        for (let i = 0; i < declarator.childCount; i++) {
+          const c = declarator.child(i);
+          if (c?.type === 'function_declarator' || c?.type === 'pointer_declarator' || c?.type === 'reference_declarator') { nextDeclarator = c; break; }
+        }
+      }
+      declarator = nextDeclarator;
     }
     if (declarator) {
-      const innerDeclarator = declarator.childForFieldName?.('declarator') ||
-                               declarator.children?.find((c: any) =>
-                                 c.type === 'qualified_identifier' || c.type === 'identifier' || c.type === 'parenthesized_declarator');
+      let innerDeclarator = declarator.childForFieldName?.('declarator');
+      if (!innerDeclarator) {
+        for (let i = 0; i < declarator.childCount; i++) {
+          const c = declarator.child(i);
+          if (c?.type === 'qualified_identifier' || c?.type === 'identifier'
+            || c?.type === 'field_identifier' || c?.type === 'parenthesized_declarator') { innerDeclarator = c; break; }
+        }
+      }
 
       if (innerDeclarator?.type === 'qualified_identifier') {
-        const nameNode = innerDeclarator.childForFieldName?.('name') ||
-                          innerDeclarator.children?.find((c: any) => c.type === 'identifier');
+        let nameNode = innerDeclarator.childForFieldName?.('name');
+        if (!nameNode) {
+          for (let i = 0; i < innerDeclarator.childCount; i++) {
+            const c = innerDeclarator.child(i);
+            if (c?.type === 'identifier') { nameNode = c; break; }
+          }
+        }
         if (nameNode?.text) {
           funcName = nameNode.text;
           label = 'Method';
         }
-      } else if (innerDeclarator?.type === 'identifier') {
+      } else if (innerDeclarator?.type === 'identifier' || innerDeclarator?.type === 'field_identifier') {
+        // field_identifier is used for method names inside C++ class bodies
         funcName = innerDeclarator.text;
+        if (innerDeclarator.type === 'field_identifier') label = 'Method';
       } else if (innerDeclarator?.type === 'parenthesized_declarator') {
-        const nestedId = innerDeclarator.children?.find((c: any) =>
-          c.type === 'qualified_identifier' || c.type === 'identifier');
+        let nestedId: SyntaxNode | null = null;
+        for (let i = 0; i < innerDeclarator.childCount; i++) {
+          const c = innerDeclarator.child(i);
+          if (c?.type === 'qualified_identifier' || c?.type === 'identifier') { nestedId = c; break; }
+        }
         if (nestedId?.type === 'qualified_identifier') {
-          const nameNode = nestedId.childForFieldName?.('name') ||
-                            nestedId.children?.find((c: any) => c.type === 'identifier');
+          let nameNode = nestedId.childForFieldName?.('name');
+          if (!nameNode) {
+            for (let i = 0; i < nestedId.childCount; i++) {
+              const c = nestedId.child(i);
+              if (c?.type === 'identifier') { nameNode = c; break; }
+            }
+          }
           if (nameNode?.text) {
             funcName = nameNode.text;
             label = 'Method';
@@ -405,38 +453,72 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
 
     // Fallback for other languages (Kotlin uses simple_identifier, Swift uses simple_identifier)
     if (!funcName) {
-      const nameNode = node.childForFieldName?.('name') ||
-                        node.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier' || c.type === 'simple_identifier');
+      let nameNode = node.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < node.childCount; i++) {
+          const c = node.child(i);
+          if (c?.type === 'identifier' || c?.type === 'property_identifier' || c?.type === 'simple_identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
     }
   } else if (node.type === 'impl_item') {
-    const funcItem = node.children?.find((c: any) => c.type === 'function_item');
+    let funcItem: SyntaxNode | null = null;
+    for (let i = 0; i < node.childCount; i++) {
+      const c = node.child(i);
+      if (c?.type === 'function_item') { funcItem = c; break; }
+    }
     if (funcItem) {
-      const nameNode = funcItem.childForFieldName?.('name') ||
-                        funcItem.children?.find((c: any) => c.type === 'identifier');
+      let nameNode = funcItem.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < funcItem.childCount; i++) {
+          const c = funcItem.child(i);
+          if (c?.type === 'identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
       label = 'Method';
     }
   } else if (node.type === 'method_definition') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'property_identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'property_identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   } else if (node.type === 'method_declaration' || node.type === 'constructor_declaration') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   } else if (node.type === 'arrow_function' || node.type === 'function_expression') {
     const parent = node.parent;
     if (parent?.type === 'variable_declarator') {
-      const nameNode = parent.childForFieldName?.('name') ||
-                        parent.children?.find((c: any) => c.type === 'identifier');
+      let nameNode = parent.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < parent.childCount; i++) {
+          const c = parent.child(i);
+          if (c?.type === 'identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
     }
   } else if (node.type === 'method' || node.type === 'singleton_method') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   }
@@ -521,6 +603,14 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
 
 export interface MethodSignature {
   parameterCount: number | undefined;
+  /** Number of required (non-optional, non-default) parameters.
+   *  Only set when fewer than parameterCount — enables range-based arity filtering.
+   *  undefined means all parameters are required (or metadata unavailable). */
+  requiredParameterCount: number | undefined;
+  /** Per-parameter type names extracted via extractSimpleTypeName.
+   *  Only populated for languages with method overloading (Java, Kotlin, C#, C++).
+   *  undefined (not []) when no types are extractable — avoids empty array allocations. */
+  parameterTypes: string[] | undefined;
   returnType: string | undefined;
 }
 
@@ -536,10 +626,12 @@ const CALL_ARGUMENT_LIST_TYPES = new Set([
  */
 export const extractMethodSignature = (node: SyntaxNode | null | undefined): MethodSignature => {
   let parameterCount: number | undefined = 0;
+  let requiredCount = 0;
   let returnType: string | undefined;
   let isVariadic = false;
+  const paramTypes: string[] = [];
 
-  if (!node) return { parameterCount, returnType };
+  if (!node) return { parameterCount, requiredParameterCount: undefined, parameterTypes: undefined, returnType };
 
   const paramListTypes = new Set([
     'formal_parameters', 'parameters', 'parameter_list',
@@ -554,6 +646,32 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     'list_splat_pattern',              // Python: *args
     'dictionary_splat_pattern',        // Python: **kwargs
   ]);
+
+  /** AST node types that represent parameters with default values. */
+  const OPTIONAL_PARAM_TYPES = new Set([
+    'optional_parameter',                // TypeScript, Ruby: (x?: number), (x: number = 5), def f(x = 5)
+    'default_parameter',                 // Python: def f(x=5)
+    'typed_default_parameter',           // Python: def f(x: int = 5)
+    'optional_parameter_declaration',    // C++: void f(int x = 5)
+  ]);
+
+  /** Check if a parameter node has a default value (handles Kotlin, C#, Swift, PHP
+   *  where defaults are expressed as child nodes rather than distinct node types). */
+  const hasDefaultValue = (paramNode: SyntaxNode): boolean => {
+    if (OPTIONAL_PARAM_TYPES.has(paramNode.type)) return true;
+    // C#, Swift, PHP: check for '=' token or equals_value_clause child
+    for (let i = 0; i < paramNode.childCount; i++) {
+      const c = paramNode.child(i);
+      if (!c) continue;
+      if (c.type === '=' || c.type === 'equals_value_clause') return true;
+    }
+    // Kotlin: default values are siblings of the parameter node, not children.
+    // The AST is: parameter, =, <literal>  — all at function_value_parameters level.
+    // Check if the immediately following sibling is '=' (default value separator).
+    const sib = paramNode.nextSibling;
+    if (sib && sib.type === '=') return true;
+    return false;
+  };
 
   const findParameterList = (current: SyntaxNode): SyntaxNode | null => {
     for (const child of current.children) {
@@ -579,6 +697,15 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
           param.type === 'self_parameter') {
         continue;
       }
+      // Kotlin: default values are siblings of the parameter node inside
+      // function_value_parameters, so they appear as named children (e.g.
+      // string_literal, integer_literal, boolean_literal, call_expression).
+      // Skip any named child that isn't a parameter-like or modifier node.
+      if (param.type.endsWith('_literal') || param.type === 'call_expression'
+        || param.type === 'navigation_expression' || param.type === 'prefix_expression'
+        || param.type === 'parenthesized_expression') {
+        continue;
+      }
       // Check for variadic parameter types
       if (VARIADIC_PARAM_TYPES.has(param.type)) {
         isVariadic = true;
@@ -601,6 +728,31 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
           isVariadic = true;
         }
       }
+      // Extract parameter type name for overload disambiguation.
+      // Works for Java (formal_parameter), Kotlin (parameter), C# (parameter),
+      // C++ (parameter_declaration). Uses childForFieldName('type') which is the
+      // standard tree-sitter field for typed parameters across these languages.
+      // Kotlin uses positional children instead of 'type' field — fall back to
+      // searching for user_type/nullable_type/predefined_type children.
+      const paramTypeNode = param.childForFieldName('type');
+      if (paramTypeNode) {
+        const typeName = extractSimpleTypeName(paramTypeNode);
+        paramTypes.push(typeName ?? 'unknown');
+      } else {
+        // Kotlin: parameter → [simple_identifier, user_type|nullable_type]
+        let found = false;
+        for (const child of param.namedChildren) {
+          if (child.type === 'user_type' || child.type === 'nullable_type'
+            || child.type === 'type_identifier' || child.type === 'predefined_type') {
+            const typeName = extractSimpleTypeName(child);
+            paramTypes.push(typeName ?? 'unknown');
+            found = true;
+            break;
+          }
+        }
+        if (!found) paramTypes.push('unknown');
+      }
+      if (!hasDefaultValue(param)) requiredCount++;
       parameterCount++;
     }
     // C/C++: bare `...` token in parameter list (not a named child — check all children)
@@ -618,9 +770,19 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
   // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
   const goResult = node.childForFieldName?.('result');
   if (goResult) {
-    returnType = goResult.type === 'parameter_list'
-      ? goResult.text   // multi-return: "(string, error)"
-      : goResult.text;  // single return: "int"
+    if (goResult.type === 'parameter_list') {
+      // Multi-return: extract first parameter's type only (e.g. (*User, error) → *User)
+      const firstParam = goResult.firstNamedChild;
+      if (firstParam?.type === 'parameter_declaration') {
+        const typeNode = firstParam.childForFieldName('type');
+        if (typeNode) returnType = typeNode.text;
+      } else if (firstParam) {
+        // Unnamed return types: (string, error) — first child is a bare type node
+        returnType = firstParam.text;
+      }
+    } else {
+      returnType = goResult.text;
+    }
   }
 
   // Rust: 'return_type' field — the value IS the type node (e.g. primitive_type, type_identifier).
@@ -640,6 +802,14 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
   }
 
+  // C#: 'returns' field on method_declaration
+  if (!returnType) {
+    const csReturn = node.childForFieldName?.('returns');
+    if (csReturn && csReturn.text !== 'void') {
+      returnType = csReturn.text;
+    }
+  }
+
   // TS/Rust/Python/C#/Kotlin: type_annotation or return_type child
   if (!returnType) {
     for (const child of node.children) {
@@ -650,9 +820,34 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
   }
 
+  // Kotlin: fun getUser(): User — return type is a bare user_type child of
+  // function_declaration. The Kotlin grammar does NOT wrap it in type_annotation
+  // or return_type; it appears as a direct child after function_value_parameters.
+  // Note: Kotlin uses function_value_parameters (not a field), so we find it by type.
+  if (!returnType) {
+    let paramsEnd = -1;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (!child) continue;
+      if (child.type === 'function_value_parameters' || child.type === 'value_parameters') {
+        paramsEnd = child.endIndex;
+      }
+      if (paramsEnd >= 0 && child.type === 'user_type' && child.startIndex > paramsEnd) {
+        returnType = child.text;
+        break;
+      }
+    }
+  }
+
   if (isVariadic) parameterCount = undefined;
 
-  return { parameterCount, returnType };
+  // Only include parameterTypes when at least one type was successfully extracted.
+  // Use undefined (not []) to avoid empty array allocations for untyped parameters.
+  const hasTypes = paramTypes.length > 0 && paramTypes.some(t => t !== 'unknown');
+  // Only set requiredParameterCount when it differs from total — saves memory on the common case.
+  const requiredParameterCount = (!isVariadic && requiredCount < (parameterCount ?? 0))
+    ? requiredCount : undefined;
+  return { parameterCount, requiredParameterCount, parameterTypes: hasTypes ? paramTypes : undefined, returnType };
 };
 
 /**
@@ -701,6 +896,7 @@ const MEMBER_ACCESS_NODE_TYPES = new Set([
   'field_expression',            // Rust/C++: obj.method() / ptr->method()
   'selector_expression',         // Go: obj.Method()
   'navigation_suffix',           // Kotlin/Swift: obj.method() — nameNode sits inside navigation_suffix
+  'member_binding_expression',   // C#: user?.Method() — null-conditional access
 ]);
 
 /**
@@ -796,6 +992,7 @@ const SIMPLE_RECEIVER_TYPES = new Set([
   'super_expression',  // Kotlin wraps super in super_expression
   'base',              // C# base.Method()
   'parent',            // PHP parent::method()
+  'constant',          // Ruby CONSTANT.method() (uppercase identifiers)
 ]);
 
 export const extractReceiverName = (
@@ -844,6 +1041,14 @@ export const extractReceiverName = (
     }
   }
 
+  // C# null-conditional: user?.Save() → conditional_access_expression wraps member_binding_expression
+  if (!receiver && parent.type === 'member_binding_expression') {
+    const condAccess = parent.parent;
+    if (condAccess?.type === 'conditional_access_expression') {
+      receiver = condAccess.firstNamedChild;
+    }
+  }
+
   // Kotlin/Swift: navigation_expression target is the first child
   if (!receiver && parent.type === 'navigation_suffix') {
     const navExpr = parent.parent;
@@ -874,6 +1079,73 @@ export const extractReceiverName = (
   return undefined;
 };
 
+/**
+ * Extract the raw receiver AST node for a member call.
+ * Unlike extractReceiverName, this returns the receiver node regardless of its type —
+ * including call_expression / method_invocation nodes that appear in chained calls
+ * like `svc.getUser().save()`.
+ *
+ * Returns undefined when the call is not a member call or when no receiver node
+ * can be found (e.g. top-level free calls).
+ */
+export const extractReceiverNode = (
+  nameNode: SyntaxNode,
+): SyntaxNode | undefined => {
+  const parent = nameNode.parent;
+  if (!parent) return undefined;
+
+  const callNode = parent.parent ?? parent;
+
+  let receiver: SyntaxNode | null = null;
+
+  receiver = parent.childForFieldName('object')
+    ?? parent.childForFieldName('value')
+    ?? parent.childForFieldName('operand')
+    ?? parent.childForFieldName('expression')
+    ?? parent.childForFieldName('argument');
+
+  if (!receiver && callNode.type === 'method_invocation') {
+    receiver = callNode.childForFieldName('object');
+  }
+
+  if (!receiver && (callNode.type === 'member_call_expression' || callNode.type === 'nullsafe_member_call_expression')) {
+    receiver = callNode.childForFieldName('object');
+  }
+
+  if (!receiver && parent.type === 'call') {
+    receiver = parent.childForFieldName('receiver');
+  }
+
+  if (!receiver && (parent.type === 'scoped_call_expression' || callNode.type === 'scoped_call_expression')) {
+    const scopedCall = parent.type === 'scoped_call_expression' ? parent : callNode;
+    receiver = scopedCall.childForFieldName('scope');
+    if (receiver?.type === 'relative_scope') {
+      receiver = receiver.firstChild;
+    }
+  }
+
+  if (!receiver && parent.type === 'member_binding_expression') {
+    const condAccess = parent.parent;
+    if (condAccess?.type === 'conditional_access_expression') {
+      receiver = condAccess.firstNamedChild;
+    }
+  }
+
+  if (!receiver && parent.type === 'navigation_suffix') {
+    const navExpr = parent.parent;
+    if (navExpr?.type === 'navigation_expression') {
+      for (const child of navExpr.children) {
+        if (child.isNamed && child !== parent) {
+          receiver = child;
+          break;
+        }
+      }
+    }
+  }
+
+  return receiver ?? undefined;
+};
+
 export const isVerboseIngestionEnabled = (): boolean => {
   const raw = process.env.GITNEXUS_VERBOSE;
   if (!raw) return false;
@@ -881,6 +1153,243 @@ export const isVerboseIngestionEnabled = (): boolean => {
   return value === '1' || value === 'true' || value === 'yes';
 };
 
+// ── Chained-call extraction ───────────────────────────────────────────────
 
+/** Node types representing call expressions across supported languages. */
+export const CALL_EXPRESSION_TYPES = new Set([
+  'call_expression',                   // TS/JS/C/C++/Go/Rust
+  'method_invocation',                 // Java
+  'member_call_expression',            // PHP
+  'nullsafe_member_call_expression',   // PHP ?.
+  'call',                              // Python/Ruby
+  'invocation_expression',             // C#
+]);
 
+/**
+ * Hard limit on chain depth to prevent runaway recursion.
+ * For `a.b().c().d()`, the chain has depth 2 (b and c before d).
+ */
+export const MAX_CHAIN_DEPTH = 3;
 
+/**
+ * Walk a receiver AST node that is itself a call expression, accumulating the
+ * chain of intermediate method names up to MAX_CHAIN_DEPTH.
+ *
+ * For `svc.getUser().save()`, called with the receiver of `save` (getUser() call):
+ *   returns { chain: ['getUser'], baseReceiverName: 'svc' }
+ *
+ * For `a.b().c().d()`, called with the receiver of `d` (c() call):
+ *   returns { chain: ['b', 'c'], baseReceiverName: 'a' }
+ */
+export function extractCallChain(
+  receiverCallNode: SyntaxNode,
+): { chain: string[]; baseReceiverName: string | undefined } | undefined {
+  const chain: string[] = [];
+  let current: SyntaxNode = receiverCallNode;
+
+  while (CALL_EXPRESSION_TYPES.has(current.type) && chain.length < MAX_CHAIN_DEPTH) {
+    // Extract the method name from this call node.
+    const funcNode = current.childForFieldName?.('function')
+      ?? current.childForFieldName?.('name')
+      ?? current.childForFieldName?.('method');  // Ruby `call` node
+    let methodName: string | undefined;
+    let innerReceiver: SyntaxNode | null = null;
+    if (funcNode) {
+      // member_expression / attribute: last named child is the method identifier
+      methodName = funcNode.lastNamedChild?.text ?? funcNode.text;
+    }
+    // Kotlin/Swift: call_expression exposes callee as firstNamedChild, not a field.
+    // navigation_expression: method name is in navigation_suffix → simple_identifier.
+    if (!funcNode && current.type === 'call_expression') {
+      const callee = current.firstNamedChild;
+      if (callee?.type === 'navigation_expression') {
+        const suffix = callee.lastNamedChild;
+        if (suffix?.type === 'navigation_suffix') {
+          methodName = suffix.lastNamedChild?.text;
+          // The receiver is the part of navigation_expression before the suffix
+          for (let i = 0; i < callee.namedChildCount; i++) {
+            const child = callee.namedChild(i);
+            if (child && child.type !== 'navigation_suffix') {
+              innerReceiver = child;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!methodName) break;
+    chain.unshift(methodName); // build chain outermost-last
+
+    // Walk into the receiver of this call to continue the chain
+    if (!innerReceiver && funcNode) {
+      innerReceiver = funcNode.childForFieldName?.('object')
+        ?? funcNode.childForFieldName?.('value')
+        ?? funcNode.childForFieldName?.('operand')
+        ?? funcNode.childForFieldName?.('expression');
+    }
+    // Java method_invocation: object field is on the call node
+    if (!innerReceiver && current.type === 'method_invocation') {
+      innerReceiver = current.childForFieldName?.('object');
+    }
+    // PHP member_call_expression
+    if (!innerReceiver && (current.type === 'member_call_expression' || current.type === 'nullsafe_member_call_expression')) {
+      innerReceiver = current.childForFieldName?.('object');
+    }
+    // Ruby `call` node: receiver field is on the call node itself
+    if (!innerReceiver && current.type === 'call') {
+      innerReceiver = current.childForFieldName?.('receiver');
+    }
+
+    if (!innerReceiver) break;
+
+    if (CALL_EXPRESSION_TYPES.has(innerReceiver.type)) {
+      current = innerReceiver; // continue walking
+    } else {
+      // Reached a simple identifier — the base receiver
+      return { chain, baseReceiverName: innerReceiver.text || undefined };
+    }
+  }
+
+  return chain.length > 0 ? { chain, baseReceiverName: undefined } : undefined;
+}
+
+/** Node types representing member/field access across languages. */
+const FIELD_ACCESS_NODE_TYPES = new Set([
+  'member_expression',           // TS/JS
+  'member_access_expression',    // C#
+  'selector_expression',         // Go
+  'field_expression',            // Rust/C++
+  'field_access',                // Java
+  'attribute',                   // Python
+  'navigation_expression',       // Kotlin/Swift
+  'member_binding_expression',   // C# null-conditional (user?.Address)
+]);
+
+/** One step in a mixed receiver chain. */
+export type MixedChainStep = { kind: 'field' | 'call'; name: string };
+
+/**
+ * Walk a receiver AST node that may interleave field accesses and method calls,
+ * building a unified chain of steps up to MAX_CHAIN_DEPTH.
+ *
+ * For `svc.getUser().address.save()`, called with the receiver of `save`
+ * (`svc.getUser().address`, a field access node):
+ *   returns { chain: [{ kind:'call', name:'getUser' }, { kind:'field', name:'address' }],
+ *             baseReceiverName: 'svc' }
+ *
+ * For `user.getAddress().city.getName()`, called with receiver of `getName`
+ * (`user.getAddress().city`):
+ *   returns { chain: [{ kind:'call', name:'getAddress' }, { kind:'field', name:'city' }],
+ *             baseReceiverName: 'user' }
+ *
+ * Pure field chains and pure call chains are special cases (all steps same kind).
+ */
+export function extractMixedChain(
+  receiverNode: SyntaxNode,
+): { chain: MixedChainStep[]; baseReceiverName: string | undefined } | undefined {
+  const chain: MixedChainStep[] = [];
+  let current: SyntaxNode = receiverNode;
+
+  while (chain.length < MAX_CHAIN_DEPTH) {
+    if (CALL_EXPRESSION_TYPES.has(current.type)) {
+      // ── Call expression: extract method name + inner receiver ────────────
+      const funcNode = current.childForFieldName?.('function')
+        ?? current.childForFieldName?.('name')
+        ?? current.childForFieldName?.('method');
+      let methodName: string | undefined;
+      let innerReceiver: SyntaxNode | null = null;
+
+      if (funcNode) {
+        methodName = funcNode.lastNamedChild?.text ?? funcNode.text;
+      }
+      // Kotlin/Swift: call_expression → navigation_expression
+      if (!funcNode && current.type === 'call_expression') {
+        const callee = current.firstNamedChild;
+        if (callee?.type === 'navigation_expression') {
+          const suffix = callee.lastNamedChild;
+          if (suffix?.type === 'navigation_suffix') {
+            methodName = suffix.lastNamedChild?.text;
+            for (let i = 0; i < callee.namedChildCount; i++) {
+              const child = callee.namedChild(i);
+              if (child && child.type !== 'navigation_suffix') { innerReceiver = child; break; }
+            }
+          }
+        }
+      }
+      if (!methodName) break;
+      chain.unshift({ kind: 'call', name: methodName });
+
+      if (!innerReceiver && funcNode) {
+        innerReceiver = funcNode.childForFieldName?.('object')
+          ?? funcNode.childForFieldName?.('value')
+          ?? funcNode.childForFieldName?.('operand')
+          ?? funcNode.childForFieldName?.('argument')    // C/C++ field_expression
+          ?? funcNode.childForFieldName?.('expression')
+          ?? null;
+      }
+      if (!innerReceiver && current.type === 'method_invocation') {
+        innerReceiver = current.childForFieldName?.('object') ?? null;
+      }
+      if (!innerReceiver && (current.type === 'member_call_expression' || current.type === 'nullsafe_member_call_expression')) {
+        innerReceiver = current.childForFieldName?.('object') ?? null;
+      }
+      if (!innerReceiver && current.type === 'call') {
+        innerReceiver = current.childForFieldName?.('receiver') ?? null;
+      }
+      if (!innerReceiver) break;
+
+      if (CALL_EXPRESSION_TYPES.has(innerReceiver.type) || FIELD_ACCESS_NODE_TYPES.has(innerReceiver.type)) {
+        current = innerReceiver;
+      } else {
+        return { chain, baseReceiverName: innerReceiver.text || undefined };
+      }
+    } else if (FIELD_ACCESS_NODE_TYPES.has(current.type)) {
+      // ── Field/member access: extract property name + inner object ─────────
+      let propertyName: string | undefined;
+      let innerObject: SyntaxNode | null = null;
+
+      if (current.type === 'navigation_expression') {
+        for (const child of current.children ?? []) {
+          if (child.type === 'navigation_suffix') {
+            for (const sc of child.children ?? []) {
+              if (sc.isNamed && sc.type !== '.') { propertyName = sc.text; break; }
+            }
+          } else if (child.isNamed && !innerObject) {
+            innerObject = child;
+          }
+        }
+      } else if (current.type === 'attribute') {
+        innerObject = current.childForFieldName?.('object') ?? null;
+        propertyName = current.childForFieldName?.('attribute')?.text;
+      } else {
+        innerObject = current.childForFieldName?.('object')
+          ?? current.childForFieldName?.('value')
+          ?? current.childForFieldName?.('operand')
+          ?? current.childForFieldName?.('argument')    // C/C++ field_expression
+          ?? current.childForFieldName?.('expression')
+          ?? null;
+        propertyName = (current.childForFieldName?.('property')
+          ?? current.childForFieldName?.('field')
+          ?? current.childForFieldName?.('name'))?.text;
+      }
+
+      if (!propertyName) break;
+      chain.unshift({ kind: 'field', name: propertyName });
+
+      if (!innerObject) break;
+
+      if (CALL_EXPRESSION_TYPES.has(innerObject.type) || FIELD_ACCESS_NODE_TYPES.has(innerObject.type)) {
+        current = innerObject;
+      } else {
+        return { chain, baseReceiverName: innerObject.text || undefined };
+      }
+    } else {
+      // Simple identifier — this is the base receiver
+      return chain.length > 0
+        ? { chain, baseReceiverName: current.text || undefined }
+        : undefined;
+    }
+  }
+
+  return chain.length > 0 ? { chain, baseReceiverName: undefined } : undefined;
+}

@@ -9,7 +9,6 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
-import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
@@ -21,7 +20,11 @@ import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js
 const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
-import { 
+
+// tree-sitter-kotlin is an optionalDependency — may not be installed
+let Kotlin: any = null;
+try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
+import {
   getLanguageFromFilename,
   FUNCTION_NODE_TYPES,
   extractFunctionName,
@@ -31,16 +34,22 @@ import {
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
-  extractReceiverName
+  extractReceiverName,
+  extractReceiverNode,
+  extractMixedChain,
+  type MixedChainStep,
 } from '../utils.js';
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
+import { typeConfigs } from '../type-extractors/index.js';
 import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
 import { callRouters } from '../call-routing.js';
+import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
+import type { NodeLabel } from '../../graph/types.js';
 
 // ============================================================================
 // Types for serializable results
@@ -60,6 +69,7 @@ interface ParsedNode {
     astFrameworkReason?: string;
     description?: string;
     parameterCount?: number;
+    requiredParameterCount?: number;
     returnType?: string;
   };
 }
@@ -68,7 +78,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD';
+  type: 'DEFINES' | 'HAS_METHOD' | 'HAS_PROPERTY';
   confidence: number;
   reason: string;
 }
@@ -77,8 +87,12 @@ interface ParsedSymbol {
   filePath: string;
   name: string;
   nodeId: string;
-  type: string;
+  type: NodeLabel;
   parameterCount?: number;
+  requiredParameterCount?: number;
+  parameterTypes?: string[];
+  returnType?: string;
+  declaredType?: string;
   ownerId?: string;
 }
 
@@ -101,6 +115,27 @@ export interface ExtractedCall {
   /** Simple identifier of the receiver for member calls (e.g., 'user' in user.save()) */
   receiverName?: string;
   /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
+  receiverTypeName?: string;
+  /**
+   * Unified mixed chain when the receiver is a chain of field accesses and/or method calls.
+   * Steps are ordered base-first (innermost to outermost). Examples:
+   *   `svc.getUser().save()`        → chain=[{kind:'call',name:'getUser'}], receiverName='svc'
+   *   `user.address.save()`         → chain=[{kind:'field',name:'address'}], receiverName='user'
+   *   `svc.getUser().address.save()` → chain=[{kind:'call',name:'getUser'},{kind:'field',name:'address'}]
+   * Length is capped at MAX_CHAIN_DEPTH (3).
+   */
+  receiverMixedChain?: MixedChainStep[];
+}
+
+export interface ExtractedAssignment {
+  filePath: string;
+  /** generateId of enclosing function, or generateId('File', filePath) for top-level */
+  sourceId: string;
+  /** Receiver text (e.g., 'user' from user.address = value) */
+  receiverText: string;
+  /** Property name being written (e.g., 'address') */
+  propertyName: string;
+  /** Resolved type name of the receiver if available from TypeEnv */
   receiverTypeName?: string;
 }
 
@@ -135,9 +170,11 @@ export interface ParseWorkerResult {
   symbols: ParsedSymbol[];
   imports: ExtractedImport[];
   calls: ExtractedCall[];
+  assignments: ExtractedAssignment[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  skippedLanguages: Record<string, number>;
   fileCount: number;
 }
 
@@ -163,10 +200,23 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
-  [SupportedLanguages.Kotlin]: Kotlin,
+  ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+};
+
+/**
+ * Check if a language grammar is available in this worker.
+ * Duplicated from parser-loader.ts because workers can't import from the main thread.
+ * Extra filePath parameter needed to distinguish .tsx from .ts (different grammars
+ * under the same SupportedLanguages.TypeScript key).
+ */
+const isLanguageAvailable = (language: SupportedLanguages, filePath: string): boolean => {
+  const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
+    ? `${language}:tsx`
+    : language;
+  return key in languageMap && languageMap[key] != null;
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
@@ -203,7 +253,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 // Label detection from capture map
 // ============================================================================
 
-const getLabelFromCaptures = (captureMap: Record<string, any>): string | null => {
+const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
   // Skip imports (handled separately) and calls
   if (captureMap['import'] || captureMap['call']) return null;
   if (!captureMap['name']) return null;
@@ -247,9 +297,11 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     symbols: [],
     imports: [],
     calls: [],
+    assignments: [],
     heritage: [],
     routes: [],
     constructorBindings: [],
+    skippedLanguages: {},
     fileCount: 0,
   };
 
@@ -300,21 +352,29 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
 
     // Process regular files for this language
     if (regularFiles.length > 0) {
-      try {
-        setLanguage(language, regularFiles[0].path);
-        processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
-      } catch {
-        // parser unavailable — skip this language group
+      if (isLanguageAvailable(language, regularFiles[0].path)) {
+        try {
+          setLanguage(language, regularFiles[0].path);
+          processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
+        } catch {
+          // parser unavailable — skip this language group
+        }
+      } else {
+        result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + regularFiles.length;
       }
     }
 
     // Process tsx files separately (different grammar)
     if (tsxFiles.length > 0) {
-      try {
-        setLanguage(language, tsxFiles[0].path);
-        processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
-      } catch {
-        // parser unavailable — skip this language group
+      if (isLanguageAvailable(language, tsxFiles[0].path)) {
+        try {
+          setLanguage(language, tsxFiles[0].path);
+          processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+        } catch {
+          // parser unavailable — skip this language group
+        }
+      } else {
+        result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + tsxFiles.length;
       }
     }
   }
@@ -833,21 +893,45 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
-    // Build per-file type environment + constructor bindings in a single AST walk.
-    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
-    const typeEnv = buildTypeEnv(tree, language);
-    const callRouter = callRouters[language];
-
-    if (typeEnv.constructorBindings.length > 0) {
-      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
-    }
-
     let matches;
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
       console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
+    // Heritage edges (EXTENDS/IMPLEMENTS) are created by heritage-processor which runs
+    // in PARALLEL with call-processor, so the graph edges don't exist when buildTypeEnv
+    // runs. This pre-pass makes parent class information available for type resolution.
+    const fileParentMap = new Map<string, string[]>();
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      for (const c of match.captures) {
+        captureMap[c.name] = c.node;
+      }
+      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        const className: string = captureMap['heritage.class'].text;
+        const parentName: string = captureMap['heritage.extends'].text;
+        // Skip Go named fields (only anonymous fields are struct embedding)
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) continue;
+        let parents = fileParentMap.get(className);
+        if (!parents) { parents = []; fileParentMap.set(className, parents); }
+        if (!parents.includes(parentName)) parents.push(parentName);
+      }
+    }
+
+    // Build per-file type environment + constructor bindings in a single AST walk.
+    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
+    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+    const typeEnv = buildTypeEnv(tree, language, { parentMap });
+    const callRouter = callRouters[language];
+
+    if (typeEnv.constructorBindings.length > 0) {
+      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
     }
 
     for (const match of matches) {
@@ -869,6 +953,28 @@ const processFileGroup = (
           ...(namedBindings ? { namedBindings } : {}),
         });
         continue;
+      }
+
+      // Extract assignment sites (field write access)
+      if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
+        const receiverText = captureMap['assignment.receiver'].text;
+        const propertyName = captureMap['assignment.property'].text;
+        if (receiverText && propertyName) {
+          const srcId = findEnclosingFunctionId(captureMap['assignment'], file.path)
+            || generateId('File', file.path);
+          let receiverTypeName: string | undefined;
+          if (typeEnv) {
+            receiverTypeName = typeEnv.lookup(receiverText, captureMap['assignment']) ?? undefined;
+          }
+          result.assignments.push({
+            filePath: file.path,
+            sourceId: srcId,
+            receiverText,
+            propertyName,
+            ...(receiverTypeName ? { receiverTypeName } : {}),
+          });
+        }
+        if (!captureMap['call']) continue;
       }
 
       // Extract call sites
@@ -926,6 +1032,7 @@ const processFileGroup = (
                   nodeId,
                   type: 'Property',
                   ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+                  ...(item.declaredType ? { declaredType: item.declaredType } : {}),
                 });
                 const fileId = generateId('File', file.path);
                 const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
@@ -939,10 +1046,10 @@ const processFileGroup = (
                 });
                 if (propEnclosingClassId) {
                   result.relationships.push({
-                    id: generateId('HAS_METHOD', `${propEnclosingClassId}->${nodeId}`),
+                    id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
                     sourceId: propEnclosingClassId,
                     targetId: nodeId,
-                    type: 'HAS_METHOD',
+                    type: 'HAS_PROPERTY',
                     confidence: 1.0,
                     reason: '',
                   });
@@ -959,8 +1066,29 @@ const processFileGroup = (
             const sourceId = findEnclosingFunctionId(callNode, file.path)
               || generateId('File', file.path);
             const callForm = inferCallForm(callNode, callNameNode);
-            const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
-            const receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+            let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
+            let receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+            let receiverMixedChain: MixedChainStep[] | undefined;
+
+            // When the receiver is a complex expression (call chain, field chain, or mixed),
+            // extractReceiverName returns undefined. Walk the receiver node to build a unified
+            // mixed chain for deferred resolution in processCallsFromExtracted.
+            if (callForm === 'member' && receiverName === undefined && !receiverTypeName) {
+              const receiverNode = extractReceiverNode(callNameNode);
+              if (receiverNode) {
+                const extracted = extractMixedChain(receiverNode);
+                if (extracted && extracted.chain.length > 0) {
+                  receiverMixedChain = extracted.chain;
+                  receiverName = extracted.baseReceiverName;
+                  // Try the type environment immediately for the base receiver
+                  // (covers explicitly-typed locals and annotated parameters).
+                  if (receiverName) {
+                    receiverTypeName = typeEnv.lookup(receiverName, callNode);
+                  }
+                }
+              }
+            }
+
             result.calls.push({
               filePath: file.path,
               calledName,
@@ -969,6 +1097,7 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+              ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
             });
           }
         }
@@ -1018,6 +1147,23 @@ const processFileGroup = (
       const nodeLabel = getLabelFromCaptures(captureMap);
       if (!nodeLabel) continue;
 
+      // C/C++: @definition.function is broad and also matches inline class methods (inside
+      // a class/struct body). Those are already captured by @definition.method, so skip
+      // the duplicate Function entry to prevent double-indexing in globalIndex.
+      if (
+        (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) &&
+        nodeLabel === 'Function'
+      ) {
+        let ancestor = captureMap['definition.function']?.parent;
+        while (ancestor) {
+          if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
+            break; // inside a class body — duplicate of @definition.method
+          }
+          ancestor = ancestor.parent;
+        }
+        if (ancestor) continue; // found a class/struct ancestor → skip
+      }
+
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor') continue;
@@ -1040,11 +1186,30 @@ const processFileGroup = (
         : null;
 
       let parameterCount: number | undefined;
+      let requiredParameterCount: number | undefined;
+      let parameterTypes: string[] | undefined;
       let returnType: string | undefined;
+      let declaredType: string | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
+        requiredParameterCount = sig.requiredParameterCount;
+        parameterTypes = sig.parameterTypes;
         returnType = sig.returnType;
+
+        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
+        if ((!returnType || returnType === 'array' || returnType === 'iterable') && definitionNode) {
+          const tc = typeConfigs[language as keyof typeof typeConfigs];
+          if (tc?.extractReturnType) {
+            const docReturn = tc.extractReturnType(definitionNode);
+            if (docReturn) returnType = docReturn;
+          }
+        }
+      } else if (nodeLabel === 'Property' && definitionNode) {
+        // Extract the declared type for property/field nodes.
+        // Walk the definition node for type annotation children.
+        declaredType = extractPropertyDeclaredType(definitionNode);
       }
 
       result.nodes.push({
@@ -1063,6 +1228,8 @@ const processFileGroup = (
           } : {}),
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
+          ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
+          ...(parameterTypes !== undefined ? { parameterTypes } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
         },
       });
@@ -1078,6 +1245,10 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
+        ...(parameterTypes !== undefined ? { parameterTypes } : {}),
+        ...(returnType !== undefined ? { returnType } : {}),
+        ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
@@ -1092,13 +1263,14 @@ const processFileGroup = (
         reason: '',
       });
 
-      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
       if (enclosingClassId) {
+        const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         result.relationships.push({
-          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
           sourceId: enclosingClassId,
           targetId: nodeId,
-          type: 'HAS_METHOD',
+          type: memberEdgeType,
           confidence: 1.0,
           reason: '',
         });
@@ -1120,7 +1292,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1130,9 +1302,13 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.symbols.push(...src.symbols);
   target.imports.push(...src.imports);
   target.calls.push(...src.calls);
+  target.assignments.push(...src.assignments);
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  for (const [lang, count] of Object.entries(src.skippedLanguages)) {
+    target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
+  }
   target.fileCount += src.fileCount;
 };
 
@@ -1154,7 +1330,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

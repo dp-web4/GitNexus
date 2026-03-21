@@ -19,9 +19,9 @@ import {
   RELATION_SCHEMA,
   EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
-} from '../../src/core/kuzu/schema.js';
+} from '../../src/core/lbug/schema.js';
 
-describe('KuzuDB Schema', () => {
+describe('LadybugDB Schema', () => {
   describe('NODE_TABLES', () => {
     it('includes all core node types', () => {
       const core = ['File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process'];
@@ -122,11 +122,11 @@ describe('KuzuDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor, Property
+      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor', 'Property'];
+      const backtickTargets = ['Constructor'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {
