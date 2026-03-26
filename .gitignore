@@ -70,3 +70,4 @@ gitnexus/test/fixtures/lang-resolution/**/bin
 GitNexus.sln
 # Git worktrees
 .worktrees/
+.claude/skills/gitnexus/
